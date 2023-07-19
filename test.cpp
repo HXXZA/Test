@@ -1,305 +1,206 @@
-#include "resource.h"
-#include <Wincrypt.h>
+#include "download.h"
 #include <random>
 #include <wininet.h>
+#include "utils.h"
+#include <intrin.h>
 
 #undef ERROR
 
-struct AsyncInfo
+
+namespace download
 {
-    HANDLE hEvent;
-    HINTERNET hUrl;
-    error_type err;
-};
+    constexpr uint64_t MINUTE = 1000 * 10 * 60;
+    uint16_t Download::timeout = 0;
 
-void CALLBACK DownloadCallback(HINTERNET hInternet,
-                               DWORD_PTR dwContext,
-                               DWORD dwInternetStatus,
-                               LPVOID lpvStatusInformation,
-                               [[maybe_unused]] DWORD dwStatusInformationLength)
-{
-
-    if (dwInternetStatus != INTERNET_STATUS_REQUEST_COMPLETE)
+    Download::Download(string url, string hash, uint16_t _timeout)
+            : hash(std::move(hash))
     {
-        return;
+        timeout = _timeout * MINUTE;
+        URL_COMPONENTSA urlComponents = {sizeof(URL_COMPONENTS)};
+        urlComponents.dwHostNameLength = 1;
+        urlComponents.dwUrlPathLength = 1;
+
+        if (!InternetCrackUrl(url.data(), url.length(), 0, &urlComponents))
+        {
+            LOG(ERROR) << "parse url failed: " << GetLastError() << endl;
+            throw CustomException{ErrorType::url_format_error};
+        }
+
+        host_name = string(urlComponents.lpszHostName, urlComponents.dwHostNameLength);
+        LOG(INFO) << "get host name: " << host_name << endl;
+
+        url_path = string(urlComponents.lpszUrlPath, urlComponents.dwUrlPathLength);
+        LOG(INFO) << "get url path name: " << url_path << endl;
     }
-
-    auto pResult = reinterpret_cast<INTERNET_ASYNC_RESULT *>(lpvStatusInformation);
-    auto monitor = reinterpret_cast<AsyncInfo *>(dwContext);
-    if (pResult->dwError != S_OK)
-    {
-        LOG(ERROR) << "winint callback failed: " << pResult->dwError << endl;
-        monitor->err = CustomException::inner;
-        goto clean;
-    }
-    monitor->hUrl = reinterpret_cast<HINTERNET>(pResult->dwResult);
-
-    clean:
-    if (!SetEvent(monitor->hEvent))
-    {
-        LOG(ERROR) << "set event when download failed: " << GetLastError() << endl;
-        exit(CustomException::inner);
-    }
-
-}
-
-void wait_the_response(AsyncInfo async_info)
-{
-    switch (WaitForSingleObject(async_info.hEvent, resource::Download::get_timeout()))
-    {
-        case WAIT_OBJECT_0:
-            if (async_info.err != CustomException::success)
-            {
-                throw CustomException{async_info.err};
-            }
-            break;
-        case WAIT_TIMEOUT:
-            LOG(ERROR) << "the server response is so slowly failed" << endl;
-            throw CustomException{CustomException::time_out};
-        case WAIT_FAILED:
-            LOG(ERROR) << "wait response failed: " << GetLastError() << endl;
-            throw CustomException{CustomException::inner};
-    }
-}
-
-void write_file(void *exeBuf, uint32_t dwSize, const fs::path &path)
-{
-    ofstream file(path, ios::out | ios::binary);
-    if (!file.is_open())
-    {
-        LOG(ERROR) << "open file: " << path << " failed" << endl;
-        throw runtime_error("");
-    }
-
-    file.write(static_cast<char *>(exeBuf), dwSize);
-    if (file.bad())
-    {
-        LOG(ERROR) << "write to file: " << path <<
-                   " form resource file failed" << endl;
-        file.close();
-    }
-}
-
-namespace resource
-{
-    constexpr uint8_t MD5_LEN = 16;
-    constexpr char HEX_CHARSET[] = "0123456789ABCDEF";
-
-    ResourceInfo i386{0x3312, "i386_dir", RT_STRING,
-                      [](VOID *exeBuf, DWORD dwSize) -> bool
-                      {
-                          i386.field = string(reinterpret_cast<LPCCH>(exeBuf));
-                          return true;
-                      },
-                      [](HANDLE hUpdate) -> bool
-                      {
-                          return i386.update_resource(hUpdate,
-                                                      i386.field.data(),
-                                                      i386.field.length() + 1);
-                      }};
-
-    ResourceInfo amd64{0x3311, "amd64_dir", RT_STRING,
-                       [](VOID *exeBuf, DWORD dwSize) -> bool
-                       {
-                           amd64.field = string(reinterpret_cast<LPCCH>(exeBuf));
-                           return true;
-                       },
-                       [](HANDLE hUpdate) -> bool
-                       {
-                           return amd64.update_resource(hUpdate,
-                                                        amd64.field.data(),
-                                                        amd64.field.length() + 1);
-                       }};
-
-    ResourceInfo version{0x3310, "version", RT_STRING,
-                         [](VOID *exeBuf, DWORD dwSize) -> bool
-                         {
-                             auto path = path_manager::g_path_manager->get_update_version_path();
-                             try
-                             {
-                                 write_file(exeBuf, dwSize - 1, path);
-                             } catch (const std::runtime_error &e)
-                             {
-                                 return false;
-                             }
-
-                             ofstream file(path, ios::out);
-                             if (!file.is_open())
-                             {
-                                 LOG(ERROR) << "open file: " << path << " failed" << endl;
-                                 return false;
-                             }
-
-                             file.write(static_cast<char *>(exeBuf), dwSize);
-                             if (file.bad())
-                             {
-                                 LOG(ERROR) << "write to file: " << path <<
-                                            " form resource file failed" << endl;
-                                 return false;
-                             }
-                             file.close();
-                             return true;
-                         },
-                         [](HANDLE hUpdate) -> bool
-                         {
-                             return version.update_resource(hUpdate,
-                                                            version.field.data(),
-                                                            version.field.length() + 1);
-                         }};
-
-    ResourceInfo update_zip_path{0x3313, "update_zip", RT_RCDATA,
-                                 [](VOID *exeBuf, DWORD dwSize) -> bool
-                                 {
-                                     auto path = path_manager::g_path_manager->get_update_zip_path();
-                                     ofstream file(path, ios::binary | ios::out);
-                                     if (!file.is_open())
-                                     {
-                                         LOG(ERROR) << "open file: " << path << " failed" << endl;
-                                         return false;
-                                     }
-
-                                     file.write(static_cast<char *>(exeBuf), dwSize);
-                                     if (file.bad())
-                                     {
-                                         LOG(ERROR) << "write to file: " << path <<
-                                                    " form resource file failed" << endl;
-                                         return false;
-                                     }
-                                     file.close();
-                                     return true;;
-                                 },
-                                 [](HANDLE hUpdate) -> bool
-                                 {
-                                     ifstream file(path_manager::g_path_manager->update_zip_file_name);
-                                     if (!file.is_open())
-                                     {
-                                         LOG(ERROR) << "open file: "
-                                                    << path_manager::g_path_manager->update_zip_file_name
-                                                    << "for add resources failed" << endl;
-                                         return false;
-                                     }
-
-                                     vector<unsigned char> contents((istreambuf_iterator<char>(file)),
-                                                                    istreambuf_iterator<char>());
-                                     if (file.bad())
-                                     {
-                                         LOG(ERROR) << "read file: "
-                                                    << path_manager::g_path_manager->update_zip_file_name
-                                                    << "to buffer for add resouces failed" << endl;
-                                         return false;
-                                     }
-
-                                     return i386.update_resource(hUpdate,
-                                                                 contents.data(),
-                                                                 contents.size());
-                                 }};
 
     void Download::get_zip()
     {
         LOG(INFO) << "start to download zip" << endl;
-        HINTERNET hInternet = nullptr;
-        HANDLE hEvent = nullptr;
-        HINTERNET hUrl = nullptr;
-        auto err = CustomException::success;
-        auto async_info = AsyncInfo{nullptr, nullptr, CustomException::success};
+
+        HINTERNET hInternet;
+        HINTERNET hConnect = nullptr;
+        HINTERNET hRequest = nullptr;
+        auto err = ErrorType::success;
+        auto async_info = AsyncInfo{nullptr, nullptr, ErrorType::success};
+        uint64_t download_length = 0;
+
+        DWORD dwFlags;
+        DWORD dwBuffLen = sizeof(DWORD);
+
         std::ofstream file;
+        DWORD bytesRead = 0;
+        const int bufferSize = 1024;
+
 
         hInternet = InternetOpen(win_inet.data(),
-                                 INTERNET_OPEN_TYPE_DIRECT,
+                                 INTERNET_OPEN_TYPE_PRECONFIG,
                                  nullptr,
                                  nullptr,
                                  INTERNET_FLAG_ASYNC);
         if (nullptr == hInternet)
         {
             LOG(ERROR) << "open internet instance failed: " << GetLastError() << endl;
-            err = CustomException::inner;
+            err = ErrorType::inner_failed;
             goto clean;
         }
 
-        if (INTERNET_INVALID_STATUS_CALLBACK == InternetSetStatusCallbackA(hInternet, DownloadCallback))
+        if (INTERNET_INVALID_STATUS_CALLBACK == InternetSetStatusCallbackA(hInternet, Download::DownloadCallback))
         {
             LOG(ERROR) << "set download call back failed: " << GetLastError() << endl;
-            err = CustomException::inner;
+            err = ErrorType::inner_failed;
             goto clean;
         }
 
-        hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-        if (!hEvent)
+        async_info.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+        if (!async_info.hEvent)
         {
-            LOG(ERROR) << "create async for download failed: " << GetLastError() << endl;
-            err = CustomException::inner;
+            LOG(ERROR) << "create async event for download failed: " << GetLastError() << endl;
+            err = ErrorType::inner_failed;
             goto clean;
         }
 
-        async_info.hEvent = hEvent;
-        hUrl = InternetOpenUrl(hInternet,
-                               url.data(),
-                               nullptr,
-                               0,
-                               INTERNET_FLAG_RELOAD,
-                               reinterpret_cast<DWORD_PTR>(&async_info));
-
-        if (nullptr == hUrl)
+        hConnect = InternetConnect(hInternet,
+                                   host_name.data(),
+                                   INTERNET_DEFAULT_HTTPS_PORT,
+                                   nullptr, nullptr, INTERNET_SERVICE_HTTP, 0,
+                                   reinterpret_cast<DWORD_PTR>(&async_info));
+        if (nullptr == hConnect)
         {
-            if (ERROR_IO_PENDING != GetLastError())
+            LOG(ERROR) << "create internet connection for download failed: " << GetLastError() << endl;
+            err = ErrorType::inner_failed;
+            goto clean;
+        }
+
+        hRequest = HttpOpenRequest(hConnect,
+                                   "GET",
+                                   url_path.data(),
+                                   nullptr,
+                                   nullptr,
+                                   nullptr,
+                                   INTERNET_FLAG_HYPERLINK |
+                                   INTERNET_FLAG_RELOAD |
+                                   INTERNET_FLAG_KEEP_CONNECTION |
+                                   INTERNET_FLAG_NO_CACHE_WRITE |
+                                   INTERNET_FLAG_PRAGMA_NOCACHE |
+                                   INTERNET_FLAG_RESYNCHRONIZE |
+                                   INTERNET_FLAG_SECURE,
+                                   reinterpret_cast<DWORD_PTR>(&async_info));
+
+        if (nullptr == hRequest)
+        {
+            LOG(ERROR) << "open http request failed : " << GetLastError() << endl;
+            err = ErrorType::inner_failed;
+            goto clean;
+        }
+
+        if (!InternetQueryOption(hRequest, INTERNET_OPTION_SECURITY_FLAGS, &dwFlags, &dwBuffLen))
+        {
+            LOG(ERROR) << "get http security flag failed: " << GetLastError() << endl;
+            err = ErrorType::inner_failed;
+            goto clean;
+        }
+
+        dwFlags |= SECURITY_FLAG_IGNORE_UNKNOWN_CA;
+        dwFlags |= SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
+        dwFlags |= SECURITY_FLAG_IGNORE_CERT_CN_INVALID;
+        dwFlags |= SECURITY_FLAG_IGNORE_REVOCATION;
+
+        if (!InternetSetOption(hRequest, INTERNET_OPTION_SECURITY_FLAGS, &dwFlags, sizeof(dwFlags)))
+        {
+            LOG(ERROR) << "set http security flag failed: " << GetLastError() << endl;
+            err = ErrorType::inner_failed;
+            goto clean;
+        }
+
+        if (!HttpSendRequest(hRequest, nullptr, 0, nullptr, 0))
+        {
+            if (ERROR_IO_PENDING == GetLastError())
             {
-                LOG(ERROR) << "open internet url instance failed: " << GetLastError() << endl;
-                err = CustomException::inner;
+                err = handle_wait_response(async_info);
+                if (err != ErrorType::success)
+                {
+                    goto clean;
+                }
+            }
+            else
+            {
+                LOG(ERROR) << "send http request failed: " << GetLastError() << endl;
+                err = ErrorType::inner_failed;
                 goto clean;
             }
         }
 
-        try
+        if (!HttpQueryInfo(hRequest,
+                           HTTP_QUERY_CONTENT_LENGTH | HTTP_QUERY_FLAG_NUMBER,
+                           &dwFlags,
+                           &dwBuffLen,
+                           nullptr))
         {
-            wait_the_response(async_info);
-        }
-        catch (CustomException &e)
-        {
-            err = e.code();
-            goto clean;
+            LOG(INFO) << "get http header failed: " << GetLastError() << endl;
         }
 
-        const int bufferSize = 4096;
+        LOG(INFO) << "get http content length: " << dwFlags << endl;
+
         char buffer[bufferSize];
-        DWORD bytesRead = 0;
-        hUrl = async_info.hUrl;
-        hEvent = async_info.hEvent;
-
-        file.open(path_manager::g_path_manager->update_zip_file_name, std::ios::binary);
+        file.open(path_manager::g_path_manager->download_zip_path, std::ios::binary);
         if (!file.is_open())
         {
             LOG(ERROR) << "create download file :"
-                       << path_manager::g_path_manager->update_zip_file_name
-                       << "failed"
+                       << path_manager::g_path_manager->download_zip_path
+                       << " failed"
                        << endl;
-            err = CustomException::inner;
+            err = ErrorType::inner_failed;
         }
+
+//        cout<<88;
         while (true)
         {
-            if (!InternetReadFile(hUrl, buffer, bufferSize, &bytesRead))
+            bytesRead = 0;
+            if (!InternetReadFile(hRequest, buffer, bufferSize, &bytesRead))
             {
                 if (ERROR_IO_PENDING == GetLastError())
                 {
-                    try
+                    cout<<"com"<<endl;
+                    err = handle_wait_response(async_info);
+                    if (err != ErrorType::success)
                     {
-                        wait_the_response(async_info);
-                    }
-                    catch (CustomException &e)
-                    {
-                        err = e.code();
                         goto clean;
                     }
-                    ResetEvent(async_info.hEvent);
                 }
                 else
                 {
-                    LOG(ERROR) << "InternetReadFile failed: " << GetLastError() << endl;
-                    err = CustomException::inner;
+                    LOG(ERROR) << "send http request failed: " << GetLastError() << endl;
+                    err = ErrorType::inner_failed;
                     goto clean;
-                    break;
                 }
             }
             else
+            {
+                cout<<"bytesRead" << bytesRead<<endl;
+                download_length += bytesRead;
+                LOG(ERROR) << "get total buf: " << uint64_t(download_length / 1024)
+                           << " MB" << endl;
+
                 if (bytesRead == 0)
                 {
                     break;
@@ -307,32 +208,38 @@ namespace resource
                 else
                 {
                     file.write(buffer, bytesRead);
-                    if (file.bad())
+                    if (!file.good())
                     {
-                        LOG(ERROR) << "create download file : " << path_manager::g_path_manager->update_zip_file_name
+                        LOG(ERROR) << "create download file : "
+                                   << path_manager::g_path_manager->download_zip_path
                                    << "failed" << endl;
-                        err = CustomException::inner;
+                        err = ErrorType::inner_failed;
                         goto clean;
                     }
                 }
+            }
         }
-
 
         clean:
 
-        if (nullptr == hUrl)
+        if (nullptr != hRequest)
         {
-            InternetCloseHandle(hUrl);
+            InternetCloseHandle(hRequest);
         }
 
-        if (nullptr == hInternet)
+        if (nullptr != hConnect)
+        {
+            InternetCloseHandle(hConnect);
+        }
+
+        if (nullptr != hInternet)
         {
             InternetCloseHandle(hInternet);
         }
 
-        if (hEvent)
+        if (nullptr != async_info.hEvent)
         {
-            CloseHandle(hEvent);
+            CloseHandle(async_info.hEvent);
         }
 
         if (file.is_open())
@@ -340,12 +247,56 @@ namespace resource
             file.close();
         }
 
-        if (err != CustomException::success)
+        if (err != ErrorType::success)
         {
             throw CustomException{err};
         }
 
         LOG(INFO) << "download zip successfully" << endl;
+    }
+
+    VOID CALLBACK Download::DownloadCallback([[maybe_unused]] HINTERNET hInternet,
+                                             DWORD_PTR dwContext,
+                                             DWORD dwInternetStatus,
+                                             LPVOID lpvStatusInformation,
+                                             [[maybe_unused]] DWORD dwStatusInformationLength)
+    {
+        if (dwInternetStatus != INTERNET_STATUS_REQUEST_COMPLETE)
+        {
+            return;
+        }
+        cout<<99;
+        auto pResult = reinterpret_cast<INTERNET_ASYNC_RESULT *>(lpvStatusInformation);
+        auto pMonitor = reinterpret_cast<AsyncInfo *>(dwContext);
+
+        if (pResult->dwError != S_OK)
+        {
+            LOG(ERROR) << "winlnet callback failed: " << pResult->dwError << endl;
+            pMonitor->err = ErrorType::inner_failed;
+            goto clean;
+        }
+//        const int bufferSize = 65535;
+//        char buffer[bufferSize];
+//        DWORD bytesRead = 0;
+
+//        if (!InternetReadFile(pMonitor->hRequest, buffer, bufferSize, &bytesRead))
+//        {
+//            if (ERROR_IO_PENDING == GetLastError())
+//            {
+//                cout << 33;
+//            }
+//            else
+//            {
+//                cout << 55;
+//            }
+//        }
+
+        _ReadWriteBarrier();
+        clean:
+        if (!SetEvent(pMonitor->hEvent))
+        {
+            LOG(ERROR) << "set event when download failed: " << GetLastError() << endl;
+        }
     }
 
     int Download::get_timeout()
@@ -359,216 +310,141 @@ namespace resource
 
     void Download::check_zip()
     {
-        LOG(INFO) << "start to calculate hash" << endl;
+        LOG(INFO) << "start to validate hash" << endl;
 
         HCRYPTPROV hProv{0};
-        if (CryptAcquireContext(&hProv,
-                                nullptr,
-                                nullptr,
-                                PROV_RSA_FULL,
-                                CRYPT_VERIFYCONTEXT) == FALSE)
+        HCRYPTHASH hHash{0};
+        auto err = ErrorType::success;
+        string calculate_hash;
+        array<BYTE, Download::md5_len> buf{};
+        DWORD length = Download::md5_len;
+        vector<unsigned char> contents;
+
+        if (!CryptAcquireContext(&hProv,
+                                 nullptr,
+                                 nullptr,
+                                 PROV_RSA_FULL,
+                                 CRYPT_VERIFYCONTEXT)
+                )
         {
             LOG(ERROR) << "prepare crypt context failed: " << GetLastError() << endl;
-            throw CustomException{CustomException::inner};
+            err = ErrorType::inner_failed;
+            goto clean;
         }
 
-
-        HCRYPTHASH hHash{0};
-        if (CryptCreateHash(hProv, CALG_MD5, 0, 0, &hHash) == FALSE)
+        if (!CryptCreateHash(hProv, CALG_MD5, 0, 0, &hHash))
         {
             LOG(ERROR) << "create handle of hash: md5 failed: " << GetLastError() << endl;
-            CryptReleaseContext(hProv, 0);
-            throw CustomException{CustomException::inner};
+            err = ErrorType::inner_failed;
+            goto clean;
         }
-
-        ifstream file(path_manager::g_path_manager->update_zip_file_name);
-        if (!file.is_open())
-        {
-            LOG(ERROR) << "open file: " << path_manager::g_path_manager->update_zip_file_name
-                       << "for calculate hash failed" << endl;
-            CryptDestroyHash(hHash);
-            CryptReleaseContext(hProv, 0);
-            throw CustomException{CustomException::inner};
-        }
-
-        vector<unsigned char> contents((istreambuf_iterator<char>(file)),
-                                       istreambuf_iterator<char>());
-        if (file.bad())
-        {
-            LOG(ERROR) << "read file: " << path_manager::g_path_manager->update_zip_file_name
-                       << "to buffer for calculate hash failed" << endl;
-            CryptDestroyHash(hHash);
-            CryptReleaseContext(hProv, 0);
-            throw CustomException{CustomException::inner};
-        }
-
-        array<BYTE, MD5_LEN> buf{};
-        DWORD length = MD5_LEN;
-        if (!CryptGetHashParam(hHash, HP_HASHVAL, buf.data(), &length, 0))
-        {
-            LOG(ERROR) << "calculate file: " << path_manager::g_path_manager->update_zip_file_name
-                       << "hash failed"
-                       << endl;
-            CryptDestroyHash(hHash);
-            CryptReleaseContext(hProv, 0);
-            throw CustomException{CustomException::inner};
-        }
-
-        string calculate_hash;
-        for (int i = 0; i < MD5_LEN; i++)
-        {
-            calculate_hash += HEX_CHARSET[((buf[i] >> 4) & 0xF)];
-            calculate_hash += HEX_CHARSET[((buf[i]) & 0x0F)];
-        }
-
-        if (calculate_hash != hash)
-        {
-            LOG(ERROR) << "calculate file: " << path_manager::g_path_manager->update_zip_file_name
-                       << "hash is "
-                       << calculate_hash
-                       << "is different to ini hash: "
-                       << hash
-                       << endl;
-            throw CustomException{CustomException::hash_diff};
-        }
-
-        CryptDestroyHash(hHash);
-        CryptReleaseContext(hProv, 0);
-        file.close();
-        LOG(INFO) << "calculate hash successfully" << endl;
-    }
-
-    bool ResourceInfo::update_resource(HANDLE hUpdate, LPVOID pBuf, DWORD dwLength)
-    {
-        if (!UpdateResource(hUpdate,
-                            this->type,
-                            MAKEINTRESOURCE(this->id),
-                            MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-                            pBuf,
-                            dwLength))
-        {
-            LOG(ERROR) << "update resource: " <<
-                       this->id_string
-                       << " failed :"
-                       << GetLastError();
-
-            return false;
-        }
-
-        LOG(INFO) << "update resource: " <<
-                  this->id_string
-                  << " successfully";
-        return true;
-    }
-
-    void ResourceInfo::write_resource(const string &path)
-    {
-        LOG(ERROR) << "start to write resource";
-
-        auto tmp_file = path_manager::g_path_manager->update_gen_file_name_prefix.string()
-                        + path_manager::g_path_manager->version_file_name.string()
-                        + ".exe";
-        fs::remove(tmp_file);
 
         try
         {
-            fs::copy_file(path, tmp_file);
+            contents = read_file(path_manager::g_path_manager->download_zip_path, true);
+        }
+        catch (const CustomException &e)
+        {
+            LOG(ERROR) << "calculate hash" << e.what() << endl;
+            err = e.code();
+            goto clean;
         }
 
-        catch (const fs::filesystem_error &e)
+        if (!CryptHashData(hHash, contents.data(), contents.size(), 0))
         {
-            LOG(ERROR) << "copy self to: " << tmp_file << " failed: " << e.what() << " :" << e.code();
-            throw CustomException{CustomException::inner};
+            LOG(ERROR) << "create hash data for file: " << path_manager::g_path_manager->download_zip_path
+                       << "failed" << GetLastError() << endl;
+            err = ErrorType::inner_failed;
+            goto clean;
         }
 
-        ifstream file(path_manager::g_path_manager->update_zip_file_name, ios::binary);
-        if (!file.is_open())
+        if (!CryptGetHashParam(hHash, HP_HASHVAL, buf.data(), &length, 0))
         {
-            LOG(ERROR) << "open " << path_manager::g_path_manager->update_zip_file_name << " failed";
-            throw CustomException{CustomException::inner};
+            LOG(ERROR) << "calculate file: " << path_manager::g_path_manager->download_zip_path
+                       << "hash failed"
+                       << GetLastError() << endl;
+            err = ErrorType::inner_failed;
+            goto clean;
         }
 
-        vector<uint8_t> buf((istreambuf_iterator<char>(file)), istreambuf_iterator<char>());
-        if (file.bad())
+        for (int i = 0; i < length; i++)
         {
-            LOG(ERROR) << "read " << path_manager::g_path_manager->update_zip_file_name
-                       << "as buf incorrectly";
-            throw CustomException{CustomException::inner};
-        }
-        file.close();
-
-        HANDLE hUpdate = BeginUpdateResource(tmp_file.data(), FALSE);
-        if (nullptr == hUpdate)
-        {
-            LOG(ERROR) << "start to write resource failed: " << GetLastError();
-            throw CustomException{CustomException::inner};
+            calculate_hash += Download::hex_charset[((buf[i] >> 4))];
+            calculate_hash += Download::hex_charset[((buf[i]) & 0x0F)];
         }
 
-        if (i386.update(hUpdate))
+        std::transform(hash.begin(), hash.end(), hash.begin(),
+                       [](unsigned char c)
+                       {
+                           return std::toupper(c);
+                       }
+        );
+
+        if (calculate_hash != hash)
         {
-            throw CustomException{CustomException::inner};
+            LOG(ERROR) << "calculate file: " << path_manager::g_path_manager->download_zip_path
+                       << "hash is "
+                       << calculate_hash
+                       << " is different to ini hash: "
+                       << hash
+                       << endl;
+            err = ErrorType::hash_diff;
+            goto clean;
         }
 
-        if (amd64.update(hUpdate))
+        clean:
+
+        if (0 != hHash)
         {
-            throw CustomException{CustomException::inner};
+            CryptDestroyHash(hHash);
         }
 
-        if (version.update(hUpdate))
+        if (0 != hProv)
         {
-            throw CustomException{CustomException::inner};
+            CryptReleaseContext(hProv, 0);
         }
 
-        if (update_zip_path.update(hUpdate))
+        if (err != ErrorType::success)
         {
-            throw CustomException{CustomException::inner};
+            throw CustomException{err};
         }
 
-        if (!EndUpdateResource(hUpdate, FALSE))
-        {
-            LOG(ERROR) << "write zip to exe file failed: " << GetLastError();
-            throw CustomException{CustomException::inner};
-        }
+        LOG(INFO) << "validate hash successfully" << endl;
     }
 
-
-    void ResourceInfo::release_resource()
+    ErrorType Download::handle_wait_response(AsyncInfo &async_info)
     {
-        HRSRC hRes = FindResource(nullptr, MAKEINTRESOURCE(this->id), this->type);
-        if (nullptr == hRes)
+        try
         {
-            LOG(ERROR) << "find id: " << this->id_string
-                       << "in resource file failed: " << GetLastError();
-            throw CustomException{CustomException::inner};
+            wait_the_response(async_info);
+        }
+        catch (CustomException &e)
+        {
+            ResetEvent(async_info.hEvent);
+            return e.code();
         }
 
-        HGLOBAL hResLoad = LoadResource(nullptr, hRes);
-        if (nullptr == hResLoad)
-        {
-            LOG(ERROR) << "load id: " << this->id_string
-                       << " form resource file failed: " << GetLastError() << endl;
-            throw CustomException{CustomException::inner};
-        }
+        ResetEvent(async_info.hEvent);
+        return ErrorType::success;
+    }
 
-        DWORD dwSize = SizeofResource(nullptr, hRes);
-        if (dwSize == 0)
+    void Download::wait_the_response(AsyncInfo &async_info)
+    {
+        switch (WaitForSingleObject(async_info.hEvent, download::Download::get_timeout()))
         {
-            LOG(ERROR) << "get_zip id: " << this->id_string
-                       << " size in resource file failed: " << GetLastError() << endl;
-            throw CustomException{CustomException::inner};
-        }
-
-        VOID *exeBuf = LockResource(hResLoad);
-        if (nullptr == exeBuf)
-        {
-            LOG(ERROR) << "get_zip id: " << this->id_string
-                       << " address in resource file failed: " << GetLastError() << endl;
-            throw CustomException{CustomException::inner};
-        }
-
-        if (this->release(exeBuf, dwSize))
-        {
-            throw CustomException{CustomException::inner};
+            case WAIT_OBJECT_0:
+                if (async_info.err != ErrorType::success)
+                {
+                    throw CustomException{async_info.err};
+                }
+                break;
+            case WAIT_TIMEOUT:
+                LOG(ERROR) << "the server response is so slowly failed" << endl;
+                throw CustomException{ErrorType::timeout};
+            case WAIT_FAILED:
+                LOG(ERROR) << "wait response failed: " << GetLastError() << endl;
+                throw CustomException{ErrorType::inner_failed};
         }
     }
-} // resource
+}
+// download
